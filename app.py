@@ -5,29 +5,39 @@ import zipfile
 import urllib.parse
 import traceback
 import shutil
-from flask import Flask, request, render_template_string, Response
+import time
+from flask import Flask, request, render_template_string, send_file
 from werkzeug.utils import secure_filename
 
-# 🚀 終極記憶體防護：強制系統將所有暫存檔寫入實體硬碟，嚴禁使用 RAM Disk (/tmp)
+# 🚀 終極記憶體防護：強制系統將所有暫存檔寫入實體硬碟
 LOCAL_TEMP_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_processing')
-shutil.rmtree(LOCAL_TEMP_BASE, ignore_errors=True) # 啟動時先清理舊的垃圾
 os.makedirs(LOCAL_TEMP_BASE, exist_ok=True)
 os.environ['TMPDIR'] = LOCAL_TEMP_BASE
-tempfile.tempdir = LOCAL_TEMP_BASE  # 強制覆寫 Python 與 Flask 的預設暫存路徑
+tempfile.tempdir = LOCAL_TEMP_BASE
+
+def cleanup_old_temp_dirs():
+    """🧹 自動資源回收：清除超過 30 分鐘的舊暫存資料夾，避免硬碟塞爆"""
+    try:
+        now = time.time()
+        for dirname in os.listdir(LOCAL_TEMP_BASE):
+            dir_path = os.path.join(LOCAL_TEMP_BASE, dirname)
+            if os.path.isdir(dir_path):
+                # 如果資料夾存在超過 1800 秒 (30 分鐘)
+                if now - os.path.getmtime(dir_path) > 1800:
+                    shutil.rmtree(dir_path, ignore_errors=True)
+    except Exception as e:
+        print(f"清理舊暫存檔失敗: {e}")
 
 # 🌟 嘗試載入 Python 內建的 FFmpeg 引擎
 try:
     import imageio_ffmpeg
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 except ImportError:
-    # 若本地端沒安裝該套件，則退回使用系統預設的 ffmpeg 指令
     FFMPEG_EXE = "ffmpeg"
 
 app = Flask(__name__)
-# 允許最大上傳 500MB 的檔案
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 
 
-# 升級版前端介面：加入精確的動態進度追蹤器
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
@@ -66,7 +76,6 @@ HTML_PAGE = """
             </button>
         </form>
 
-        <!-- 升級版動態進度條區塊 -->
         <div id="progressContainer" class="hidden mt-6">
             <div class="flex justify-between text-sm font-medium text-blue-600 mb-1">
                 <span id="statusText">準備中...</span>
@@ -91,7 +100,6 @@ HTML_PAGE = """
         form.addEventListener('submit', (e) => {
             e.preventDefault(); 
             
-            // 鎖定表單與按鈕
             btn.disabled = true;
             btn.classList.add('opacity-50', 'cursor-not-allowed');
             progressContainer.classList.remove('hidden');
@@ -122,9 +130,9 @@ HTML_PAGE = """
             };
 
             xhr.onprogress = (event) => {
-                statusText.innerText = '⬇️ 處理完成！下載結果中...';
+                statusText.innerText = '⬇️ 處理完成！精準下載中...';
                 progressBar.className = 'bg-emerald-500 h-2.5 rounded-full transition-all duration-300';
-                progressHint.innerText = '正在將打包好的 ZIP 檔下載至您的設備。';
+                progressHint.innerText = '檔案大小已確認，正在安全地將 ZIP 檔下載至您的設備。';
                 
                 if (event.lengthComputable) {
                     const percent = Math.round((event.loaded / event.total) * 100);
@@ -141,12 +149,20 @@ HTML_PAGE = """
                     statusText.innerText = '✅ 任務圓滿完成！';
                     percentText.innerText = '100%';
                     progressBar.style.width = '100%';
-                    progressHint.innerText = '您的檔案應該已經自動開始下載了。';
+                    progressHint.innerText = '您的檔案已經完整下載。';
 
                     let filename = "cut_audio.zip";
                     const disposition = xhr.getResponseHeader('Content-Disposition');
-                    if (disposition && disposition.includes('filename*=UTF-8\\'\\'')) {
-                        filename = decodeURIComponent(disposition.split('filename*=UTF-8\\'\\'')[1]);
+                    if (disposition) {
+                        const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/);
+                        if (utf8Match) {
+                            filename = decodeURIComponent(utf8Match[1]);
+                        } else {
+                            const normalMatch = disposition.match(/filename="?([^";]+)"?/);
+                            if (normalMatch) {
+                                filename = decodeURIComponent(normalMatch[1]);
+                            }
+                        }
                     }
 
                     const blob = xhr.response;
@@ -171,7 +187,7 @@ HTML_PAGE = """
             };
 
             xhr.onerror = () => {
-                alert('網路錯誤：伺服器沒有回應或處理逾時。');
+                alert('網路錯誤：伺服器沒有回應或下載意外中斷。');
                 statusText.innerText = '❌ 連線中斷';
                 progressBar.className = 'bg-red-500 h-2.5 rounded-full';
             };
@@ -200,6 +216,9 @@ def index():
 
 @app.route('/api/cut', methods=['POST'])
 def cut_audio():
+    # 👉 每次有人使用，就先執行垃圾回收，保持伺服器硬碟健康
+    cleanup_old_temp_dirs()
+    
     temp_dir = None
     try:
         if 'file' not in request.files:
@@ -220,7 +239,6 @@ def cut_audio():
             
         base_name, _ = os.path.splitext(filename)
 
-        # 這裡會安全地使用我們在最上方設定好的 LOCAL_TEMP_BASE
         temp_dir = tempfile.mkdtemp()
         
         input_path = os.path.join(temp_dir, filename)
@@ -229,7 +247,6 @@ def cut_audio():
         segment_time = minutes * 60
         output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
 
-        # 🚀 執行 FFmpeg 並加上隱藏日誌功能，減少記憶體與效能消耗
         cmd = [
             FFMPEG_EXE,
             "-hide_banner",
@@ -246,7 +263,7 @@ def cut_audio():
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            return "【系統錯誤】找不到 FFmpeg 核心！請確定 requirements.txt 中有加入 imageio-ffmpeg。", 500
+            return "【系統錯誤】找不到 FFmpeg 核心！", 500
         except subprocess.CalledProcessError as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return "【FFmpeg 執行錯誤】: 裁減過程發生錯誤", 500
@@ -260,23 +277,13 @@ def cut_audio():
                     file_path = os.path.join(temp_dir, f)
                     zf.write(file_path, f)
 
-        def generate():
-            try:
-                with open(zip_path, 'rb') as f:
-                    while chunk := f.read(8192):
-                        yield chunk
-            finally:
-                # 檔案順利傳輸完畢後，安全地清空實體硬碟空間
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        encoded_filename = urllib.parse.quote("已裁減_雲端處理.zip")
-
-        return Response(
-            generate(),
+        # 🚀 拋棄會引發中斷的 Generator，改用最穩定的 send_file！
+        # send_file 會自動提供檔案的精確大小 (Content-Length)，確保瀏覽器能 100% 完整下載。
+        return send_file(
+            zip_path,
             mimetype='application/zip',
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
-            }
+            as_attachment=True,
+            download_name=f"{base_name}_已裁減.zip"
         )
 
     except Exception as e:
