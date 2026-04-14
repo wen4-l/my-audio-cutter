@@ -4,14 +4,13 @@ import tempfile
 import zipfile
 import io
 import urllib.parse
+import traceback
 from flask import Flask, request, render_template_string, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-# 設定最大上傳檔案大小限制為 500MB (保護伺服器不被塞爆)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 
 
-# 前端 HTML 介面 (與之前類似，但直接與此伺服器溝通)
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
@@ -58,7 +57,7 @@ HTML_PAGE = """
                 </svg>
                 <span>檔案上傳與處理中...</span>
             </div>
-            <p class="text-xs text-slate-400">這可能需要幾分鐘，請勿關閉網頁。</p>
+            <p class="text-xs text-slate-400">這可能需要幾分鐘，請勿關閉網頁或鎖定螢幕。</p>
         </div>
     </div>
 
@@ -76,7 +75,6 @@ HTML_PAGE = """
             const formData = new FormData(form);
 
             try {
-                // 將資料上傳到後端伺服器 API
                 const response = await fetch('/api/cut', {
                     method: 'POST',
                     body: formData
@@ -89,7 +87,6 @@ HTML_PAGE = """
                         filename = decodeURIComponent(disposition.split('filename*=UTF-8\\'\\'')[1]);
                     }
 
-                    // 處理完成，觸發下載
                     const blob = await response.blob();
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
@@ -101,10 +98,10 @@ HTML_PAGE = """
                     window.URL.revokeObjectURL(url);
                 } else {
                     const errorText = await response.text();
-                    alert('伺服器處理失敗：' + errorText);
+                    alert('伺服器處理失敗：\\n' + errorText);
                 }
             } catch (error) {
-                alert('網路錯誤：伺服器可能沒有回應。');
+                alert('網路錯誤：伺服器可能沒有回應，或處理時間過長。');
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -123,70 +120,74 @@ def index():
 
 @app.route('/api/cut', methods=['POST'])
 def cut_audio():
-    if 'file' not in request.files:
-        return "沒有接收到檔案", 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return "沒有選擇檔案", 400
-
+    # 使用 try...except 包覆全部邏輯，避免直接拋出 500 HTML 錯誤頁面
     try:
-        minutes = int(request.form.get('minutes', 30))
-    except ValueError:
-        return "分鐘數格式錯誤", 400
+        if 'file' not in request.files:
+            return "沒有接收到檔案，請重新選擇", 400
 
-    # 安全處理檔名 (避免伺服器路徑注入攻擊)
-    filename = secure_filename(file.filename)
-    # 如果檔名都是中文，secure_filename 會變成空字串，提供預設名稱
-    if not filename:
-        filename = "audio_upload.m4a"
-        
-    base_name, _ = os.path.splitext(filename)
-
-    # 使用 tempfile 建立安全的暫存空間，處理完畢自動刪除不佔雲端空間
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = os.path.join(temp_dir, filename)
-        file.save(input_path)
-
-        segment_time = minutes * 60
-        output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
-
-        # 呼叫伺服器系統中的 FFmpeg
-        cmd = [
-            "ffmpeg",
-            "-i", input_path,
-            "-f", "segment",
-            "-segment_time", str(segment_time),
-            "-reset_timestamps", "1",
-            "-c", "copy",
-            output_pattern
-        ]
+        file = request.files['file']
+        if file.filename == '':
+            return "沒有選擇檔案", 400
 
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            return f"FFmpeg 處理失敗: {e.stderr.decode('utf-8', errors='ignore')}", 500
+            minutes = int(request.form.get('minutes', 30))
+        except ValueError:
+            return "分鐘數格式錯誤，請輸入數字", 400
 
-        # 將切好的檔案全部打包成一個 ZIP 檔存在記憶體中
-        memory_file = io.BytesIO()
-        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for f in os.listdir(temp_dir):
-                if f.startswith(f"{base_name}_part") and f.endswith(".m4a"):
-                    file_path = os.path.join(temp_dir, f)
-                    zf.write(file_path, f)
+        filename = secure_filename(file.filename)
+        if not filename:
+            filename = "audio_upload.m4a"
+            
+        base_name, _ = os.path.splitext(filename)
 
-        memory_file.seek(0)
-    
-    encoded_filename = urllib.parse.quote(f"已裁減_雲端處理.zip")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, filename)
+            file.save(input_path)
 
-    return send_file(
-        memory_file,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=f"已裁減_雲端處理.zip"
-    )
+            segment_time = minutes * 60
+            output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
+
+            cmd = [
+                "ffmpeg",
+                "-i", input_path,
+                "-f", "segment",
+                "-segment_time", str(segment_time),
+                "-reset_timestamps", "1",
+                "-c", "copy",
+                output_pattern
+            ]
+
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except FileNotFoundError:
+                # 若發生此錯誤，代表 Railway 沒有正確安裝 ffmpeg
+                return "【系統錯誤】伺服器內找不到 FFmpeg 指令！請確認您的 apt.txt 檔案名稱全小寫，內容為 ffmpeg。", 500
+            except subprocess.CalledProcessError as e:
+                return f"【FFmpeg 執行錯誤】: {e.stderr.decode('utf-8', errors='ignore')}", 500
+
+            memory_file = io.BytesIO()
+            with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for f in os.listdir(temp_dir):
+                    if f.startswith(f"{base_name}_part") and f.endswith(".m4a"):
+                        file_path = os.path.join(temp_dir, f)
+                        zf.write(file_path, f)
+
+            memory_file.seek(0)
+        
+        encoded_filename = urllib.parse.quote(f"已裁減_雲端處理.zip")
+
+        return send_file(
+            memory_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"已裁減_雲端處理.zip"
+        )
+    except Exception as e:
+        # 捕捉所有未預期的錯誤並回傳清楚的訊息
+        error_msg = traceback.format_exc()
+        print(error_msg) # 將錯誤列印到 Railway 後台以便除錯
+        return f"【伺服器發生未預期錯誤】: {str(e)}", 500
 
 if __name__ == '__main__':
-    # 這裡綁定 0.0.0.0 讓雲端主機可以對外開放 Port
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
