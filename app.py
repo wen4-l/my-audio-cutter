@@ -8,6 +8,14 @@ import shutil
 from flask import Flask, request, render_template_string, Response
 from werkzeug.utils import secure_filename
 
+# 🌟 終極解法：嘗試載入 Python 內建的 FFmpeg 引擎
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    # 若本地端沒安裝該套件，則退回使用系統預設的 ffmpeg 指令
+    FFMPEG_EXE = "ffmpeg"
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 
 
@@ -84,9 +92,8 @@ HTML_PAGE = """
             const xhr = new XMLHttpRequest();
 
             xhr.open('POST', '/api/cut', true);
-            xhr.responseType = 'blob'; // 告訴瀏覽器我們期待收到一個檔案(ZIP)
+            xhr.responseType = 'blob'; 
 
-            // 階段 1：監聽上傳進度
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
                     const percent = Math.round((event.loaded / event.total) * 100);
@@ -98,23 +105,19 @@ HTML_PAGE = """
                 }
             };
 
-            // 階段 2：上傳完成，伺服器開始處理 (FFmpeg 運轉中)
             xhr.upload.onload = () => {
                 statusText.innerText = '⚙️ 處理與打包中...';
                 percentText.innerText = '請稍候';
                 progressBar.style.width = '100%';
-                // 改成紫色呼吸燈效果，代表伺服器正在努力運算
                 progressBar.className = 'bg-indigo-500 h-2.5 rounded-full animate-pulse transition-all duration-300';
                 progressHint.innerText = '伺服器正在裁減您的音檔，這可能需要幾分鐘，請勿關閉網頁。';
             };
 
-            // 階段 3：處理完成，瀏覽器開始接收 ZIP 下載
             xhr.onprogress = (event) => {
                 statusText.innerText = '⬇️ 處理完成！下載結果中...';
                 progressBar.className = 'bg-emerald-500 h-2.5 rounded-full transition-all duration-300';
                 progressHint.innerText = '正在將打包好的 ZIP 檔下載至您的設備。';
                 
-                // 因為串流 ZIP 無法預先知道總長度，若無法計算則顯示文字提示
                 if (event.lengthComputable) {
                     const percent = Math.round((event.loaded / event.total) * 100);
                     percentText.innerText = `${percent}%`;
@@ -125,7 +128,6 @@ HTML_PAGE = """
                 }
             };
 
-            // 階段 4：全部完成，觸發存檔
             xhr.onload = () => {
                 if (xhr.status === 200) {
                     statusText.innerText = '✅ 任務圓滿完成！';
@@ -133,7 +135,6 @@ HTML_PAGE = """
                     progressBar.style.width = '100%';
                     progressHint.innerText = '您的檔案應該已經自動開始下載了。';
 
-                    // 取得檔名並觸發下載
                     let filename = "cut_audio.zip";
                     const disposition = xhr.getResponseHeader('Content-Disposition');
                     if (disposition && disposition.includes('filename*=UTF-8\\'\\'')) {
@@ -150,7 +151,6 @@ HTML_PAGE = """
                     a.click();
                     window.URL.revokeObjectURL(url);
                 } else {
-                    // 發生錯誤，因為 response 是 blob 格式，我們需要把它轉回文字來顯示錯誤訊息
                     const reader = new FileReader();
                     reader.onload = () => {
                         alert('❌ 伺服器處理失敗：\\n' + reader.result);
@@ -162,14 +162,12 @@ HTML_PAGE = """
                 }
             };
 
-            // 網路斷線處理
             xhr.onerror = () => {
                 alert('網路錯誤：伺服器沒有回應或連線中斷。');
                 statusText.innerText = '❌ 連線中斷';
                 progressBar.className = 'bg-red-500 h-2.5 rounded-full';
             };
 
-            // 無論成功或失敗，最後都要解鎖按鈕
             xhr.onloadend = () => {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -181,7 +179,6 @@ HTML_PAGE = """
                 }, 4000);
             };
 
-            // 正式發送資料
             xhr.send(formData);
         });
     </script>
@@ -223,8 +220,9 @@ def cut_audio():
         segment_time = minutes * 60
         output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
 
+        # 🚀 使用我們自帶的 FFMPEG_EXE 變數
         cmd = [
-            "ffmpeg",
+            FFMPEG_EXE,
             "-i", input_path,
             "-f", "segment",
             "-segment_time", str(segment_time),
@@ -237,7 +235,7 @@ def cut_audio():
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            return "【系統錯誤】伺服器內找不到 FFmpeg 指令！請確認您的 apt.txt 檔案名稱全小寫，內容為 ffmpeg。", 500
+            return "【系統錯誤】找不到 FFmpeg 核心！請確定 requirements.txt 中有加入 imageio-ffmpeg。", 500
         except subprocess.CalledProcessError as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return "【FFmpeg 執行錯誤】: 裁減過程發生錯誤", 500
