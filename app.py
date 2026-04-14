@@ -8,7 +8,14 @@ import shutil
 from flask import Flask, request, render_template_string, Response
 from werkzeug.utils import secure_filename
 
-# 🌟 終極解法：嘗試載入 Python 內建的 FFmpeg 引擎
+# 🚀 終極記憶體防護：強制系統將所有暫存檔寫入實體硬碟，嚴禁使用 RAM Disk (/tmp)
+LOCAL_TEMP_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_processing')
+shutil.rmtree(LOCAL_TEMP_BASE, ignore_errors=True) # 啟動時先清理舊的垃圾
+os.makedirs(LOCAL_TEMP_BASE, exist_ok=True)
+os.environ['TMPDIR'] = LOCAL_TEMP_BASE
+tempfile.tempdir = LOCAL_TEMP_BASE  # 強制覆寫 Python 與 Flask 的預設暫存路徑
+
+# 🌟 嘗試載入 Python 內建的 FFmpeg 引擎
 try:
     import imageio_ffmpeg
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -17,6 +24,7 @@ except ImportError:
     FFMPEG_EXE = "ffmpeg"
 
 app = Flask(__name__)
+# 允許最大上傳 500MB 的檔案
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 
 
 # 升級版前端介面：加入精確的動態進度追蹤器
@@ -36,7 +44,7 @@ HTML_PAGE = """
                 <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
             </div>
             <h1 class="text-2xl font-bold text-slate-800">雲端 M4A 裁減中心</h1>
-            <p class="text-slate-500 mt-2 text-sm">檔案將上傳至伺服器處理，不消耗您的手機效能。</p>
+            <p class="text-slate-500 mt-2 text-sm">檔案將上傳至伺服器硬碟處理，不消耗您的手機效能。</p>
         </div>
 
         <form id="uploadForm" class="space-y-6">
@@ -110,7 +118,7 @@ HTML_PAGE = """
                 percentText.innerText = '請稍候';
                 progressBar.style.width = '100%';
                 progressBar.className = 'bg-indigo-500 h-2.5 rounded-full animate-pulse transition-all duration-300';
-                progressHint.innerText = '伺服器正在裁減您的音檔，這可能需要幾分鐘，請勿關閉網頁。';
+                progressHint.innerText = '伺服器正在實體硬碟中裁減音檔，這可能需要幾分鐘，請勿關閉網頁。';
             };
 
             xhr.onprogress = (event) => {
@@ -163,7 +171,7 @@ HTML_PAGE = """
             };
 
             xhr.onerror = () => {
-                alert('網路錯誤：伺服器沒有回應或連線中斷。');
+                alert('網路錯誤：伺服器沒有回應或處理逾時。');
                 statusText.innerText = '❌ 連線中斷';
                 progressBar.className = 'bg-red-500 h-2.5 rounded-full';
             };
@@ -212,6 +220,7 @@ def cut_audio():
             
         base_name, _ = os.path.splitext(filename)
 
+        # 這裡會安全地使用我們在最上方設定好的 LOCAL_TEMP_BASE
         temp_dir = tempfile.mkdtemp()
         
         input_path = os.path.join(temp_dir, filename)
@@ -220,9 +229,11 @@ def cut_audio():
         segment_time = minutes * 60
         output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
 
-        # 🚀 使用我們自帶的 FFMPEG_EXE 變數
+        # 🚀 執行 FFmpeg 並加上隱藏日誌功能，減少記憶體與效能消耗
         cmd = [
             FFMPEG_EXE,
+            "-hide_banner",
+            "-loglevel", "error",
             "-i", input_path,
             "-f", "segment",
             "-segment_time", str(segment_time),
@@ -255,6 +266,7 @@ def cut_audio():
                     while chunk := f.read(8192):
                         yield chunk
             finally:
+                # 檔案順利傳輸完畢後，安全地清空實體硬碟空間
                 shutil.rmtree(temp_dir, ignore_errors=True)
         
         encoded_filename = urllib.parse.quote("已裁減_雲端處理.zip")
