@@ -2,15 +2,16 @@ import os
 import subprocess
 import tempfile
 import zipfile
-import io
 import urllib.parse
 import traceback
-from flask import Flask, request, render_template_string, send_file
+import shutil
+from flask import Flask, request, render_template_string, Response
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 
 
+# 升級版前端介面：加入精確的動態進度追蹤器
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
@@ -49,45 +50,97 @@ HTML_PAGE = """
             </button>
         </form>
 
-        <div id="loading" class="hidden mt-6 text-center text-blue-600 font-medium">
-            <div class="flex items-center justify-center space-x-2 mb-2">
-                <svg class="animate-spin h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span>檔案上傳與處理中...</span>
+        <!-- 升級版動態進度條區塊 -->
+        <div id="progressContainer" class="hidden mt-6">
+            <div class="flex justify-between text-sm font-medium text-blue-600 mb-1">
+                <span id="statusText">準備中...</span>
+                <span id="percentText">0%</span>
             </div>
-            <p class="text-xs text-slate-400">這可能需要幾分鐘，請勿關閉網頁或鎖定螢幕。</p>
+            <div class="w-full bg-slate-200 rounded-full h-2.5 overflow-hidden">
+                <div id="progressBar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+            <p id="progressHint" class="text-xs text-slate-400 mt-2 text-center">請勿關閉網頁或鎖定螢幕。</p>
         </div>
     </div>
 
     <script>
         const form = document.getElementById('uploadForm');
         const btn = document.getElementById('submitBtn');
-        const loading = document.getElementById('loading');
+        const progressContainer = document.getElementById('progressContainer');
+        const statusText = document.getElementById('statusText');
+        const percentText = document.getElementById('percentText');
+        const progressBar = document.getElementById('progressBar');
+        const progressHint = document.getElementById('progressHint');
 
-        form.addEventListener('submit', async (e) => {
+        form.addEventListener('submit', (e) => {
             e.preventDefault(); 
+            
+            // 鎖定表單與按鈕
             btn.disabled = true;
             btn.classList.add('opacity-50', 'cursor-not-allowed');
-            loading.classList.remove('hidden');
+            progressContainer.classList.remove('hidden');
 
             const formData = new FormData(form);
+            const xhr = new XMLHttpRequest();
 
-            try {
-                const response = await fetch('/api/cut', {
-                    method: 'POST',
-                    body: formData
-                });
+            xhr.open('POST', '/api/cut', true);
+            xhr.responseType = 'blob'; // 告訴瀏覽器我們期待收到一個檔案(ZIP)
 
-                if (response.ok) {
+            // 階段 1：監聽上傳進度
+            xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    const percent = Math.round((event.loaded / event.total) * 100);
+                    statusText.innerText = '⬆️ 檔案上傳中...';
+                    percentText.innerText = `${percent}%`;
+                    progressBar.style.width = `${percent}%`;
+                    progressBar.className = 'bg-blue-600 h-2.5 rounded-full transition-all duration-300';
+                    progressHint.innerText = '正在將錄音檔傳送至雲端伺服器，請保持網路暢通。';
+                }
+            };
+
+            // 階段 2：上傳完成，伺服器開始處理 (FFmpeg 運轉中)
+            xhr.upload.onload = () => {
+                statusText.innerText = '⚙️ 處理與打包中...';
+                percentText.innerText = '請稍候';
+                progressBar.style.width = '100%';
+                // 改成紫色呼吸燈效果，代表伺服器正在努力運算
+                progressBar.className = 'bg-indigo-500 h-2.5 rounded-full animate-pulse transition-all duration-300';
+                progressHint.innerText = '伺服器正在裁減您的音檔，這可能需要幾分鐘，請勿關閉網頁。';
+            };
+
+            // 階段 3：處理完成，瀏覽器開始接收 ZIP 下載
+            xhr.onprogress = (event) => {
+                statusText.innerText = '⬇️ 處理完成！下載結果中...';
+                progressBar.className = 'bg-emerald-500 h-2.5 rounded-full transition-all duration-300';
+                progressHint.innerText = '正在將打包好的 ZIP 檔下載至您的設備。';
+                
+                // 因為串流 ZIP 無法預先知道總長度，若無法計算則顯示文字提示
+                if (event.lengthComputable) {
+                    const percent = Math.round((event.loaded / event.total) * 100);
+                    percentText.innerText = `${percent}%`;
+                    progressBar.style.width = `${percent}%`;
+                } else {
+                    percentText.innerText = '下載中';
+                    progressBar.style.width = '100%';
+                }
+            };
+
+            // 階段 4：全部完成，觸發存檔
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    statusText.innerText = '✅ 任務圓滿完成！';
+                    percentText.innerText = '100%';
+                    progressBar.style.width = '100%';
+                    progressHint.innerText = '您的檔案應該已經自動開始下載了。';
+
+                    // 取得檔名並觸發下載
                     let filename = "cut_audio.zip";
-                    const disposition = response.headers.get('Content-Disposition');
+                    const disposition = xhr.getResponseHeader('Content-Disposition');
                     if (disposition && disposition.includes('filename*=UTF-8\\'\\'')) {
                         filename = decodeURIComponent(disposition.split('filename*=UTF-8\\'\\'')[1]);
                     }
 
-                    const blob = await response.blob();
+                    const blob = xhr.response;
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.style.display = 'none';
@@ -97,17 +150,39 @@ HTML_PAGE = """
                     a.click();
                     window.URL.revokeObjectURL(url);
                 } else {
-                    const errorText = await response.text();
-                    alert('伺服器處理失敗：\\n' + errorText);
+                    // 發生錯誤，因為 response 是 blob 格式，我們需要把它轉回文字來顯示錯誤訊息
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        alert('❌ 伺服器處理失敗：\\n' + reader.result);
+                        statusText.innerText = '❌ 處理失敗';
+                        progressHint.innerText = '請重試或檢查檔案是否正確。';
+                        progressBar.className = 'bg-red-500 h-2.5 rounded-full';
+                    };
+                    reader.readAsText(xhr.response);
                 }
-            } catch (error) {
-                alert('網路錯誤：伺服器可能沒有回應，或處理時間過長。');
-            } finally {
+            };
+
+            // 網路斷線處理
+            xhr.onerror = () => {
+                alert('網路錯誤：伺服器沒有回應或連線中斷。');
+                statusText.innerText = '❌ 連線中斷';
+                progressBar.className = 'bg-red-500 h-2.5 rounded-full';
+            };
+
+            // 無論成功或失敗，最後都要解鎖按鈕
+            xhr.onloadend = () => {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
-                loading.classList.add('hidden');
-                form.reset();
-            }
+                setTimeout(() => {
+                    if (xhr.status === 200) {
+                        progressContainer.classList.add('hidden');
+                        form.reset();
+                    }
+                }, 4000);
+            };
+
+            // 正式發送資料
+            xhr.send(formData);
         });
     </script>
 </body>
@@ -120,7 +195,7 @@ def index():
 
 @app.route('/api/cut', methods=['POST'])
 def cut_audio():
-    # 使用 try...except 包覆全部邏輯，避免直接拋出 500 HTML 錯誤頁面
+    temp_dir = None
     try:
         if 'file' not in request.files:
             return "沒有接收到檔案，請重新選擇", 400
@@ -140,52 +215,66 @@ def cut_audio():
             
         base_name, _ = os.path.splitext(filename)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, filename)
-            file.save(input_path)
-
-            segment_time = minutes * 60
-            output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
-
-            cmd = [
-                "ffmpeg",
-                "-i", input_path,
-                "-f", "segment",
-                "-segment_time", str(segment_time),
-                "-reset_timestamps", "1",
-                "-c", "copy",
-                output_pattern
-            ]
-
-            try:
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except FileNotFoundError:
-                # 若發生此錯誤，代表 Railway 沒有正確安裝 ffmpeg
-                return "【系統錯誤】伺服器內找不到 FFmpeg 指令！請確認您的 apt.txt 檔案名稱全小寫，內容為 ffmpeg。", 500
-            except subprocess.CalledProcessError as e:
-                return f"【FFmpeg 執行錯誤】: {e.stderr.decode('utf-8', errors='ignore')}", 500
-
-            memory_file = io.BytesIO()
-            with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for f in os.listdir(temp_dir):
-                    if f.startswith(f"{base_name}_part") and f.endswith(".m4a"):
-                        file_path = os.path.join(temp_dir, f)
-                        zf.write(file_path, f)
-
-            memory_file.seek(0)
+        temp_dir = tempfile.mkdtemp()
         
-        encoded_filename = urllib.parse.quote(f"已裁減_雲端處理.zip")
+        input_path = os.path.join(temp_dir, filename)
+        file.save(input_path)
 
-        return send_file(
-            memory_file,
+        segment_time = minutes * 60
+        output_pattern = os.path.join(temp_dir, f"{base_name}_part%03d.m4a")
+
+        cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-f", "segment",
+            "-segment_time", str(segment_time),
+            "-reset_timestamps", "1",
+            "-c", "copy",
+            output_pattern
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return "【系統錯誤】伺服器內找不到 FFmpeg 指令！請確認您的 apt.txt 檔案名稱全小寫，內容為 ffmpeg。", 500
+        except subprocess.CalledProcessError as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return "【FFmpeg 執行錯誤】: 裁減過程發生錯誤", 500
+
+        zip_filename = f"{base_name}_已裁減.zip"
+        zip_path = os.path.join(temp_dir, zip_filename)
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for f in os.listdir(temp_dir):
+                if f.startswith(f"{base_name}_part") and f.endswith(".m4a"):
+                    file_path = os.path.join(temp_dir, f)
+                    zf.write(file_path, f)
+
+        def generate():
+            try:
+                with open(zip_path, 'rb') as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        encoded_filename = urllib.parse.quote("已裁減_雲端處理.zip")
+
+        return Response(
+            generate(),
             mimetype='application/zip',
-            as_attachment=True,
-            download_name=f"已裁減_雲端處理.zip"
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            }
         )
+
     except Exception as e:
-        # 捕捉所有未預期的錯誤並回傳清楚的訊息
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
         error_msg = traceback.format_exc()
-        print(error_msg) # 將錯誤列印到 Railway 後台以便除錯
+        print(error_msg)
         return f"【伺服器發生未預期錯誤】: {str(e)}", 500
 
 if __name__ == '__main__':
